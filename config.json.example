@@ -1,0 +1,10 @@
+{
+  "target_uid": "12345678",
+  "output_md_file": "武忠祥老师_每日一题.md",
+  "image_dir": "bili_images",
+  "login": {
+    "sessdata": "你的SESSDATA（可选）",
+    "bili_jct": "你的bili_jct（可选）",
+    "buvid3": "你的buvid3（可选）"
+  }
+}

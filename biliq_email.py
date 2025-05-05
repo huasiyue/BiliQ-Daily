@@ -1,18 +1,24 @@
 import asyncio
 import os
-import requests
-from datetime import datetime
-from bilibili_api import user, Credential, exceptions
-import re
 import sys
 import json
+import smtplib
+import schedule
+import time
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+from bilibili_api import user, Credential, exceptions
+import re
 import traceback
+import requests
 
-
+# --- 配置加载 ---
 CONFIG_FILE = "config.json"
 
 def load_config(filename):
-    """Loads configuration from a JSON file."""
+    """从JSON文件加载配置。"""
     try:
         with open(filename, 'r', encoding='utf-8') as f:
             config = json.load(f)
@@ -28,16 +34,16 @@ def load_config(filename):
         print(f"错误：加载配置文件时发生未知错误: {e}")
         return None
 
+# --- 核心函数 ---
 async def fetch_user_dynamics(uid, credential=None):
-    """
-    获取指定用户的B站动态列表 (第一页)。
-    根据是否提供 credential 决定使用登录模式还是匿名模式。
-    """
+    """获取指定用户的B站动态列表 (第一页)。"""
     mode = "登录模式" if credential else "匿名模式"
     print(f"正在尝试以 {mode} 获取 UID {uid} 的第一页动态...")
     try:
+        # 创建User对象，仅在存在时传递credential
         target_user = user.User(uid=uid, credential=credential)
 
+        # 获取动态
         dynamics_page = await asyncio.wait_for(target_user.get_dynamics(offset=0), timeout=30.0)
 
         if dynamics_page and 'cards' in dynamics_page:
@@ -66,7 +72,7 @@ async def fetch_user_dynamics(uid, credential=None):
         return None
 
 def sanitize_filename(filename):
-    """Removes or replaces characters invalid in filenames."""
+    """移除或替换文件名中的无效字符。"""
     filename = filename.replace('/', '-').replace('\\', '-').replace('\0', '')
     invalid_chars = r'[<>:"|?*]'
     filename = re.sub(invalid_chars, '', filename)
@@ -79,7 +85,7 @@ def sanitize_filename(filename):
     return filename
 
 def download_image(url, folder, filename):
-    """Downloads an image from a URL to a specified folder."""
+    """从URL下载图片到指定文件夹。"""
     filepath = os.path.join(folder, filename)
     if not url.startswith(('http://', 'https://')):
         url = 'http:' + url if url.startswith('//') else 'https://' + url
@@ -99,46 +105,27 @@ def download_image(url, folder, filename):
     except requests.exceptions.RequestException as e: print(f"  下载图片失败: {url} - {e}"); return None
     except IOError as e: print(f"  保存图片失败: {filepath} - {e}"); return None
 
-def process_dynamics_to_markdown(dynamics_data, output_md_file, image_dir):
-    """
-    处理B站动态数据，严格筛选含“第N题”的图文动态，下载图片(命名为 N_YYYY_MM_DD)，
-    并生成/更新 Markdown 文件。
-    """
+def process_dynamics_for_email(dynamics_data, image_dir):
+    """处理B站动态数据，筛选含"第N题"的图文动态，下载图片，并返回最新的一题。"""
     if not (dynamics_data and 'cards' in dynamics_data and isinstance(dynamics_data['cards'], list)):
         print("动态数据无效或缺少 'cards' 列表，无法处理。")
-        return
+        return None
 
     os.makedirs(image_dir, exist_ok=True)
 
-    existing_content = ""
-    processed_ids = set()
-    if os.path.exists(output_md_file):
-        try:
-            with open(output_md_file, 'r', encoding='utf-8') as f:
-                existing_content = f.read()
-                processed_ids = set(re.findall(r"dynamic_id(?:_str)?:\s*(\d+)", existing_content, re.IGNORECASE)) \
-                                | set(re.findall(r"<!--\s*ID:\s*(\d+)\s*-->", existing_content)) # Add comment-based ID tracking
-                print(f"找到 {len(processed_ids)} 个可能已处理的动态 ID。")
-        except Exception as e:
-            print(f"警告：读取现有 Markdown 文件 {output_md_file} 失败: {e}")
-
-    new_markdown_entries = []
     items_list = dynamics_data['cards']
+    latest_question = None
 
     for item in items_list:
         dynamic_id_for_error = item.get('desc', {}).get('dynamic_id_str', 'N/A')
         try:
+            # 提取dynamic_id
             dynamic_id = item.get('desc', {}).get('dynamic_id_str') or \
                          item.get('display', {}).get('origin', {}).get('dynamic_id_str') or \
                          item.get('desc', {}).get('rid_str') or \
-                         item.get('basic', {}).get('comment_id_str') 
+                         item.get('basic', {}).get('comment_id_str')
 
             if not dynamic_id:
-                # print(f"  警告: 无法为某个卡片提取 dynamic_id，跳过。卡片内容片段: {str(item)[:200]}") # Debugging if needed
-                continue
-
-            if dynamic_id in processed_ids:
-                # print(f"  跳过：动态 ID {dynamic_id} 已处理过。") # Reduce noise
                 continue
 
             card_value = item.get('card')
@@ -153,14 +140,16 @@ def process_dynamics_to_markdown(dynamics_data, output_md_file, image_dir):
 
             if not card_data: print(f"  内部错误：card_data 为空。跳过。 ID: {dynamic_id}"); continue
 
+            # 获取发布时间
             pub_ts = item.get('desc', {}).get('timestamp') or \
-                     card_data.get('item', {}).get('upload_time') 
+                     card_data.get('item', {}).get('upload_time')
 
-            major_module_items = None 
+            # 提取内容 (适配多种结构)
+            major_module_items = None # 图片字典列表
             description = None
             module_dynamic = card_data.get('modules', {}).get('module_dynamic', {})
 
-            # Structure 1: 'modules' -> 'module_dynamic' -> 'major' (draw) and 'desc'
+            # 结构1: 'modules' -> 'module_dynamic' -> 'major' (draw) and 'desc'
             if module_dynamic:
                 major_data = module_dynamic.get('major', {})
                 desc_data = module_dynamic.get('desc')
@@ -169,78 +158,69 @@ def process_dynamics_to_markdown(dynamics_data, output_md_file, image_dir):
                      if draw_data and 'items' in draw_data and desc_data and 'text' in desc_data:
                          major_module_items = draw_data['items']
                          description = desc_data['text']
-                         # print(f"  找到图文内容 (结构 'modules'): ID {dynamic_id}")
 
-            # Structure 2: Direct 'item' with 'pictures' and 'description' (Older or simpler format)
+            # 结构2: 直接 'item' 带有 'pictures' 和 'description' (旧格式或简单格式)
             if major_module_items is None:
                 item_data = card_data.get('item', {})
                 if isinstance(item_data.get('pictures'), list) and item_data.get('description'):
-                    # Map 'pictures' structure to the same format as 'items' if possible
                     major_module_items = [{'src': pic.get('img_src')} for pic in item_data['pictures'] if pic.get('img_src')]
                     description = item_data['description']
-                    # print(f"  找到图文内容 (结构 'item'): ID {dynamic_id}")
 
-            # Structure 3: Origin item for forwarded dynamics (less likely for "每日一题")
+            # 结构3: 转发动态的原始项目
             if major_module_items is None and 'origin' in card_data:
                  origin_card_value = card_data.get('origin')
                  origin_card_data = None
                  if isinstance(origin_card_value, str):
                      try: origin_card_data = json.loads(origin_card_value)
-                     except json.JSONDecodeError: pass # Ignore parse error here
+                     except json.JSONDecodeError: pass
                  elif isinstance(origin_card_value, dict): origin_card_data = origin_card_value
 
                  if origin_card_data:
                     origin_item_data = origin_card_data.get('item', {})
                     if isinstance(origin_item_data.get('pictures'), list) and origin_item_data.get('description'):
                         major_module_items = [{'src': pic.get('img_src')} for pic in origin_item_data['pictures'] if pic.get('img_src')]
-                        description = origin_item_data['description'] # Use original description
+                        description = origin_item_data['description']
 
             if major_module_items is None or description is None:
-                 # print(f"  跳过：动态 ID {dynamic_id} 未找到有效的图文内容结构。")
-                 continue # Skip if no usable text/image content found
+                 continue
 
-            # --- 核心筛选和信息提取 ---
+            # 核心筛选和信息提取
             text_content = description.strip()
-            if not text_content: continue # Skip if text is empty
+            if not text_content: continue
 
-            # 1. *** 严格筛选: 必须包含 "第 N 题" ***
+            # 严格筛选: 必须包含 "第 N 题"
             question_match = re.search(r"第\s*(\d+)\s*题", text_content, re.IGNORECASE)
             if not question_match:
-                # print(f"  跳过：内容未匹配 '第 N 题'。 ID: {dynamic_id}") # Reduce noise unless debugging
                 continue
             question_number = question_match.group(1) # 提取题号 N
             print(f"  匹配到 '第 {question_number} 题', 处理中... ID: {dynamic_id}")
 
-            # 2. 生成标题
+            # 生成标题
             title = f"每日一题 | 第 {question_number} 题"
 
-            # 3. 格式化日期 (用于文件名) 和时间字符串
+            # 格式化日期和时间字符串
             pub_time_str = "未知时间"
             formatted_date_for_filename = "nodate"
             if pub_ts:
                 try:
                     dt_object = datetime.fromtimestamp(int(pub_ts))
                     pub_time_str = dt_object.strftime('%Y-%m-%d %H:%M')
-                    formatted_date_for_filename = dt_object.strftime('%Y_%m_%d') # YYYY_MM_DD
+                    formatted_date_for_filename = dt_object.strftime('%Y_%m_%d')
                 except Exception as e:
                     print(f"    解析时间戳失败: {pub_ts}, 错误: {e}")
 
-            # 4. 提取图片 URL (第一张)
+            # 提取图片 URL (第一张)
             if not (isinstance(major_module_items, list) and len(major_module_items) > 0):
                  print(f"  跳过：图片列表为空或无效。 ID: {dynamic_id}"); continue
 
-            image_info = major_module_items[0] # Take the first image structure
-            image_url = image_info.get('src') # Prefer 'src' key
+            image_info = major_module_items[0]
+            image_url = image_info.get('src')
             if not image_url:
-                # Fallback for potential different key names if needed
-                # image_url = image_info.get('img_src') # Example fallback
                 print(f"  跳过：无法获取图片 URL (检查 'src' key)。 ID: {dynamic_id}"); continue
 
-
-            # 5. *** 下载图片 (新命名: N_YYYY_MM_DD) ***
+            # 下载图片
             _, ext = os.path.splitext(image_url.split('?')[0])
-            if not ext or len(ext) > 6: ext = '.jpg' # Default to jpg, allow slightly longer extensions like .jpeg
-            # 使用提取的题号和格式化日期进行命名
+            if not ext or len(ext) > 6: ext = '.jpg'
             image_filename = sanitize_filename(f"{question_number}_{formatted_date_for_filename}{ext}")
             local_image_path = download_image(image_url, image_dir, image_filename)
 
@@ -248,105 +228,160 @@ def process_dynamics_to_markdown(dynamics_data, output_md_file, image_dir):
                 print(f"  处理失败：图片下载失败。跳过此动态。 ID: {dynamic_id}")
                 continue
 
-            # 6. 格式化 Markdown 条目
-            relative_image_path = os.path.join(image_dir, image_filename).replace('\\', '/')
-            # Add a comment with the dynamic ID for easier tracking/debugging
-            markdown_entry = f"""<!-- ID: {dynamic_id} -->
-## {title} ({pub_time_str})
-
-**文本:**
-
-{text_content}
-
-**图片:**
-
-![{title}]({relative_image_path})
-
----
-"""
-            new_markdown_entries.append(markdown_entry)
-            if dynamic_id: processed_ids.add(dynamic_id) # Ensure ID is added after successful processing
-            print(f"  成功处理并格式化动态 ID: {dynamic_id}")
+            # 如果是第一个匹配的题目，保存为最新题目
+            if latest_question is None:
+                latest_question = {
+                    'title': title,
+                    'text': text_content,
+                    'image_path': local_image_path,
+                    'pub_time': pub_time_str,
+                    'question_number': question_number
+                }
+                print(f"  找到最新题目：第 {question_number} 题")
+                break  # 只需要最新的一题
 
         except Exception as e:
             print(f"  处理动态时发生意外错误：{e}. Dynamic ID: {dynamic_id_for_error}")
             traceback.print_exc()
             continue
 
-    if new_markdown_entries:
-        # Prepend new entries to the existing content
-        final_content = "\n".join(new_markdown_entries) + "\n" + existing_content
+    return latest_question
+
+def send_email(email_config, question_data):
+    """发送包含每日一题的邮件"""
+    if not question_data:
+        print("没有找到可发送的题目数据")
+        return False
+    
+    try:
+        # 创建邮件
+        msg = MIMEMultipart()
+        msg['From'] = email_config['sender']
+        msg['To'] = email_config['receiver']
+        msg['Subject'] = f"B站每日一题 - {question_data['title']}"
+        
+        # 邮件正文
+        email_body = f"""
+        <html>
+        <body>
+            <h2>{question_data['title']} ({question_data['pub_time']})</h2>
+            <p><b>题目内容:</b></p>
+            <p>{question_data['text']}</p>
+            <p><img src="cid:question_image" width="80%"></p>
+        </body>
+        </html>
+        """
+        msg.attach(MIMEText(email_body, 'html'))
+        
+        # 添加图片附件
+        with open(question_data['image_path'], 'rb') as img_file:
+            img = MIMEImage(img_file.read())
+            img.add_header('Content-ID', '<question_image>')
+            msg.attach(img)
+        
+        # 连接到SMTP服务器并发送
+        with smtplib.SMTP_SSL(email_config['smtp_server'], email_config['smtp_port']) as server:
+            server.login(email_config['sender'], email_config['password'])
+            server.send_message(msg)
+        
+        print(f"成功发送每日一题邮件：第 {question_data['question_number']} 题")
+        return True
+    except Exception as e:
+        print(f"发送邮件时发生错误: {e}")
+        traceback.print_exc()
+        return False
+
+def job():
+    """定时任务：获取并发送每日一题"""
+    print(f"\n--- 开始执行定时任务 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ---")
+    
+    # 加载配置
+    config = load_config(CONFIG_FILE)
+    if not config:
+        print("无法加载配置，任务终止")
+        return
+    
+    # 获取配置值
+    TARGET_UID = config.get("TARGET_UID")
+    IMAGE_DIR = config.get("IMAGE_DIR", "bili_images")
+    CREDS_CONFIG = config.get("CREDENTIALS", {})
+    EMAIL_CONFIG = config.get("EMAIL", {})
+    
+    if not TARGET_UID:
+        print(f"错误: 配置文件 {CONFIG_FILE} 中缺少 TARGET_UID。")
+        return
+    
+    if not EMAIL_CONFIG or not all(k in EMAIL_CONFIG for k in ['sender', 'password', 'receiver', 'smtp_server', 'smtp_port']):
+        print("错误: 邮件配置不完整，请检查config.json中的EMAIL部分")
+        return
+    
+    print(f"目标用户 UID: {TARGET_UID}")
+    print(f"图片保存目录: {IMAGE_DIR}")
+    
+    # 尝试使用登录模式
+    credential = None
+    SESSDATA = CREDS_CONFIG.get("SESSDATA")
+    BILI_JCT = CREDS_CONFIG.get("BILI_JCT")
+    BUVID3 = CREDS_CONFIG.get("BUVID3")
+    DEDEUSERID = CREDS_CONFIG.get("DEDEUSERID")
+    
+    if SESSDATA and BILI_JCT and BUVID3:
+        print("正在使用 config.json 中的 Cookie 信息创建凭据...")
         try:
-            with open(output_md_file, 'w', encoding='utf-8') as f: f.write(final_content)
-            print(f"\n成功将 {len(new_markdown_entries)} 条新【每日一题】动态写入到 {output_md_file}")
-        except IOError as e: print(f"\n错误：写入 Markdown 文件 {output_md_file} 失败: {e}")
+            dedeuserid_val = DEDEUSERID if DEDEUSERID and DEDEUSERID.strip() else None
+            credential = Credential(sessdata=SESSDATA, bili_jct=BILI_JCT, buvid3=BUVID3, dedeuserid=dedeuserid_val)
+            print("凭据创建成功。")
+        except Exception as e:
+            print(f"错误：创建 Credential 对象失败：{e}")
+            print("将尝试切换回匿名模式。")
+            credential = None
     else:
-        print("\n没有找到新的符合【每日一题】条件的动态。")
+        print("使用匿名模式获取动态")
+    
+    # 获取动态
+    dynamics_data = asyncio.run(fetch_user_dynamics(TARGET_UID, credential))
+    
+    # 处理数据并发送邮件
+    if dynamics_data:
+        print("\n开始处理动态数据...")
+        latest_question = process_dynamics_for_email(dynamics_data, IMAGE_DIR)
+        
+        if latest_question:
+            send_email(EMAIL_CONFIG, latest_question)
+        else:
+            print("未找到符合条件的每日一题")
+    else:
+        print("\n未能成功获取动态数据，任务终止。")
 
+# --- 主执行块 ---
 if __name__ == "__main__":
-    print("--- Bilibili 动态 Markdown 生成器 (每日一题筛选版) ---")
-
-    # Load configuration
+    print("--- B站每日一题邮件发送工具 ---")
+    
+    # 加载配置
     config = load_config(CONFIG_FILE)
     if not config:
         sys.exit(1)
-
-    TARGET_UID = config.get("TARGET_UID")
-    OUTPUT_MD_FILE = config.get("OUTPUT_MD_FILE", "bilibili_dynamics.md")
-    IMAGE_DIR = config.get("IMAGE_DIR", "bili_images")
-    CREDS_CONFIG = config.get("CREDENTIALS", {})
-
-    if not TARGET_UID:
-        print(f"错误: 配置文件 {CONFIG_FILE} 中缺少 TARGET_UID。")
+    
+    # 检查邮件配置
+    if "EMAIL" not in config or not all(k in config["EMAIL"] for k in ['sender', 'password', 'receiver', 'smtp_server', 'smtp_port']):
+        print("错误: 邮件配置不完整，请在config.json中添加EMAIL部分，包含sender、password、receiver、smtp_server和smtp_port字段")
         sys.exit(1)
-
-    print(f"目标用户 UID: {TARGET_UID}")
-    print(f"输出 Markdown 文件: {OUTPUT_MD_FILE}")
-    print(f"图片保存目录: {IMAGE_DIR}")
-
-    use_login = False
-    if len(sys.argv) > 1 and sys.argv[1] == '1':
-        use_login = True
-        print("\n请求使用登录模式 (命令行参数 '1').")
-    else:
-        print("\n将使用匿名模式 (默认或命令行参数 '0').")
-        print("注意：匿名模式可能受限，或无法获取需要登录才能查看的动态。")
-
-    credential = None
-    if use_login:
-        SESSDATA = CREDS_CONFIG.get("SESSDATA")
-        BILI_JCT = CREDS_CONFIG.get("BILI_JCT")
-        BUVID3 = CREDS_CONFIG.get("BUVID3")
-        DEDEUSERID = CREDS_CONFIG.get("DEDEUSERID")
-
-        if not SESSDATA or not BILI_JCT or not BUVID3:
-            print("\n错误：请求了登录模式，但 config.json 中 CREDENTIALS 部分缺少必要的 SESSDATA, BILI_JCT 或 BUVID3。")
-            print("将尝试切换回匿名模式。")
-            use_login = False
-        else:
-            print("正在使用 config.json 中的 Cookie 信息创建凭据...")
-            try:
-                 dedeuserid_val = DEDEUSERID if DEDEUSERID and DEDEUSERID.strip() else None
-                 credential = Credential(sessdata=SESSDATA, bili_jct=BILI_JCT, buvid3=BUVID3, dedeuserid=dedeuserid_val)
-                 print("凭据创建成功。")
-            except Exception as e:
-                 print(f"错误：创建 Credential 对象失败：{e}")
-                 print("将尝试切换回匿名模式。")
-                 use_login = False
-                 credential = None
-
-    dynamics_data = asyncio.run(fetch_user_dynamics(TARGET_UID, credential))
-
-    if dynamics_data:
-        print("\n开始处理动态数据并生成 Markdown...")
-        process_dynamics_to_markdown(dynamics_data, OUTPUT_MD_FILE, IMAGE_DIR)
-        print("\n--- 处理完成 ---")
-    else:
-        print("\n未能成功获取动态数据，程序退出。请检查：")
-        print(f"1. 网络连接是否正常。")
-        if use_login: print("2. config.json 中的 Cookie (SESSDATA, bili_jct, buvid3) 是否仍然有效且未过期。")
-        else: print("2. 目标用户的动态是否公开可见，或是否需要登录查看。")
-        print(f"3. 目标用户 UID ({TARGET_UID}) 是否正确。")
-        print(f"4. 是否触发了 B站的风控策略 (如请求过于频繁)。")
-        sys.exit(1)
-
+    
+    # 首次运行立即执行一次
+    print("首次运行，立即执行一次任务...")
+    job()
+    
+    # 设置定时任务，每天8:10执行
+    schedule.every().day.at("08:10").do(job)
+    print("已设置定时任务，将在每天 08:10 执行")
+    
+    # 运行定时任务循环
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(60)  # 每分钟检查一次
+    except KeyboardInterrupt:
+        print("\n程序被用户中断")
+    except Exception as e:
+        print(f"\n程序发生错误: {e}")
+        traceback.print_exc()
